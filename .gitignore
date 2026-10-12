@@ -1,0 +1,6 @@
+# Frappe App .gitignore
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+.venv

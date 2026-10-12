@@ -1,0 +1,1 @@
+# Dependencies managed by Frappe bench

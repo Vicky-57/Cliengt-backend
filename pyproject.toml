@@ -1,0 +1,20 @@
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "frappe_client_portal"
+authors = [
+    { name = "McKHTech", email = "info@mckhtech.com"}
+]
+description = "Frappe Client Portal App for Accounting Submissions, Helpdesk & CSV Exports"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    # "frappe" is provided by bench environment
+]
+
+[project.urls]
+Homepage = "https://github.com/mckhtech/Cliengt-backend"
+Repository = "https://github.com/mckhtech/Cliengt-backend.git"
