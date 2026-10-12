@@ -5,6 +5,16 @@ app_description = "Frappe Client Portal App for Accounting Submissions, Helpdesk
 app_email = "info@mckhtech.com"
 app_license = "MIT"
 
+after_install = "frappe_client_portal.install.after_install"
+
+# Desk Client Scripts
+doctype_js = {
+    "Client Submission": "public/js/client_submission.js"
+}
+doctype_list_js = {
+    "Client Submission": "public/js/client_submission_list.js"
+}
+
 # Document Event Hooks
 doc_events = {
     "Client User Link": {

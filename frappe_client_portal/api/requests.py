@@ -20,6 +20,38 @@ def get_requests(status="Pending"):
     return {"status": "success", "data": requests}
 
 @frappe.whitelist()
+def create_staff_request(submission, company, title, message, due_date=None, is_urgent=0):
+    """Staff Desk action to request more information from client."""
+    req = frappe.get_doc({
+        "doctype": "Staff Request",
+        "submission": submission,
+        "company": company,
+        "title": title,
+        "message": message,
+        "due_date": due_date,
+        "is_urgent": int(is_urgent),
+        "status": "Pending"
+    })
+    req.insert()
+    
+    # Update linked submission status to Needs Info
+    sub = frappe.get_doc("Client Submission", submission)
+    sub.status = "Needs Info"
+    sub.rejection_reason = title
+    sub.save()
+    
+    # Send email notification to client company
+    company_email = frappe.db.get_value("Client Company", company, "email")
+    if company_email:
+        frappe.sendmail(
+            recipients=[company_email],
+            subject=f"Accountant Request: {title}",
+            message=f"<p>Your accountant has requested more information regarding submission <b>{submission}</b>:</p><p>{message}</p><p>Please log in to your portal to reply.</p>"
+        )
+        
+    return {"status": "success", "name": req.name}
+
+@frappe.whitelist()
 def reply_request(request_id, reply_text, reply_attachment=None):
     """Resolves a staff request and moves linked submission back to 'In Review'."""
     req = frappe.get_doc("Staff Request", request_id)
@@ -34,7 +66,7 @@ def reply_request(request_id, reply_text, reply_attachment=None):
         req.reply_attachment = reply_attachment
     req.save()
     
-    # Update linked submission status
+    # Update linked submission status back to In Review
     if req.submission:
         sub = frappe.get_doc("Client Submission", req.submission)
         if sub.status == "Needs Info":
