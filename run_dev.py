@@ -8,13 +8,42 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import urllib.parse
 import os
+import datetime
+import sys
+
+# Ensure UTF-8 output on Windows
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 PORT = 8000
+
+DEMO_USERS = {
+    "owner@northstar.co.uk": {
+        "name": "Sarah Mitchell",
+        "role": "Owner",
+        "company": "Northstar Creative Ltd",
+        "password": "Password123!"
+    },
+    "bookkeeper@northstar.co.uk": {
+        "name": "Priya Nair",
+        "role": "Bookkeeping",
+        "company": "Northstar Creative Ltd",
+        "password": "Password123!"
+    },
+    "payroll@northstar.co.uk": {
+        "name": "Mike Ross",
+        "role": "Payroll",
+        "company": "Northstar Creative Ltd",
+        "password": "Password123!"
+    }
+}
 
 # In-memory test state
 STATE = {
     "user": {
-        "email": "finance@northstarcreative.co.uk",
+        "email": "owner@northstar.co.uk",
         "first_name": "Sarah",
         "last_name": "Mitchell",
         "full_name": "Sarah Mitchell"
@@ -148,9 +177,13 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
             return self._send_json({
                 "status": "success",
                 "data": {
-                    "user": STATE["user"],
-                    "company": STATE["company"],
-                    "role": STATE["role"]
+                    "user": STATE["user"]["email"],
+                    "name": STATE["user"]["full_name"],
+                    "email": STATE["user"]["email"],
+                    "company": STATE["company"]["name"],
+                    "company_details": STATE["company"],
+                    "role": STATE["role"],
+                    "portal_role": STATE["role"]
                 }
             })
 
@@ -178,10 +211,25 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
 
         # 3. get_submissions
         if path.endswith("/frappe_client_portal.api.submissions.get_submissions"):
+            sub_type = query.get("submission_type", [""])[0]
+            status = query.get("status", [""])[0]
+            period = query.get("period", [""])[0]
+            search = query.get("search", [""])[0].lower()
+
+            results = list(STATE["submissions"])
+            if sub_type:
+                results = [s for s in results if s.get("submission_type") == sub_type]
+            if status:
+                results = [s for s in results if s.get("status") == status]
+            if period:
+                results = [s for s in results if s.get("period") == period]
+            if search:
+                results = [s for s in results if search in s.get("name", "").lower() or search in s.get("notes", "").lower()]
+
             return self._send_json({
                 "status": "success",
-                "data": STATE["submissions"],
-                "total": len(STATE["submissions"])
+                "data": results,
+                "total": len(results)
             })
 
         # 4. get_submission_detail
@@ -213,9 +261,9 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
             return self._send_json({
                 "status": "success",
                 "data": [
-                    {"name": "LINK-01", "user": "finance@northstarcreative.co.uk", "name_display": "Sarah Mitchell", "portal_role": "Owner", "status": "Active", "last_login": "Today, 14:00"},
-                    {"name": "LINK-02", "user": "priya@northstarcreative.co.uk", "name_display": "Priya Nair", "portal_role": "Admin", "status": "Active", "last_login": "Yesterday, 09:15"},
-                    {"name": "LINK-03", "user": "mike@northstarcreative.co.uk", "name_display": "Mike Ross", "portal_role": "Payroll", "status": "Active", "last_login": "05 Oct 2026"}
+                    {"name": "LINK-01", "user": "owner@northstar.co.uk", "name_display": "Sarah Mitchell", "portal_role": "Owner", "status": "Active", "last_login": "Today, 14:00"},
+                    {"name": "LINK-02", "user": "bookkeeper@northstar.co.uk", "name_display": "Priya Nair", "portal_role": "Bookkeeping", "status": "Active", "last_login": "Yesterday, 09:15"},
+                    {"name": "LINK-03", "user": "payroll@northstar.co.uk", "name_display": "Mike Ross", "portal_role": "Payroll", "status": "Active", "last_login": "05 Oct 2026"}
                 ]
             })
 
@@ -228,12 +276,36 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
 
         # Login
         if path.endswith("/frappe_client_portal.api.auth.login"):
+            usr = body.get("usr", "").strip().lower()
+            pwd = body.get("pwd", "")
+
+            matched = DEMO_USERS.get(usr)
+            if not matched:
+                return self._send_json({
+                    "status": "error",
+                    "message": "Invalid email address. Please use one of the demo accounts (owner@northstar.co.uk, bookkeeper@northstar.co.uk, payroll@northstar.co.uk)."
+                }, 401)
+            
+            if pwd != matched["password"]:
+                return self._send_json({
+                    "status": "error",
+                    "message": "Invalid password. The demo account password is Password123!"
+                }, 401)
+            
+            STATE["user"]["email"] = usr
+            STATE["user"]["full_name"] = matched["name"]
+            STATE["role"] = matched["role"]
+            STATE["company"]["name"] = matched["company"]
+            
             return self._send_json({
                 "status": "success",
                 "message": "Logged In",
-                "user": body.get("usr", "finance@northstarcreative.co.uk"),
-                "company": STATE["company"]["name"],
-                "role": STATE["role"]
+                "user": usr,
+                "full_name": matched["name"],
+                "company": matched["company"],
+                "role": matched["role"],
+                "portal_role": matched["role"],
+                "two_factor_required": True
             })
 
         # Logout
@@ -254,13 +326,59 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
                 "period": body.get("period", "Oct 2026"),
                 "submitted_by": STATE["user"]["full_name"],
                 "total_gross": total,
-                "creation": "Just now",
-                "modified": "Just now",
+                "creation": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "modified": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "notes": body.get("notes", ""),
                 "items": items
             }
             STATE["submissions"].insert(0, new_sub)
             return self._send_json({"status": "success", "reference": ref})
+
+        # Batch Upload Documents
+        if path.endswith("/frappe_client_portal.api.submissions.upload_documents"):
+            category = body.get("category", "Document")
+            period = body.get("period", "Oct 2026")
+            file_urls = body.get("file_urls") or body.get("fileUrls") or []
+            if isinstance(file_urls, str):
+                try:
+                    file_urls = json.loads(file_urls)
+                except Exception:
+                    file_urls = [file_urls]
+            
+            if not file_urls:
+                file_urls = ["Uploaded_Document.pdf"]
+            
+            ref = f"DOC-{1050 + len(STATE['submissions'])}"
+            created_docs = []
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            for item in file_urls:
+                if isinstance(item, dict):
+                    doc_name = item.get("name", "Document.pdf")
+                else:
+                    doc_name = str(item)
+                
+                new_sub = {
+                    "name": ref,
+                    "submission_type": category,
+                    "status": "Submitted",
+                    "period": period,
+                    "submitted_by": STATE["user"]["full_name"],
+                    "total_gross": 0.0,
+                    "creation": now_str,
+                    "modified": now_str,
+                    "notes": doc_name,
+                    "items": []
+                }
+                STATE["submissions"].insert(0, new_sub)
+                created_docs.append(new_sub)
+
+            return self._send_json({
+                "status": "success",
+                "reference": ref,
+                "message": f"Successfully uploaded {len(created_docs)} file(s)",
+                "data": STATE["submissions"]
+            })
 
         # Reply to Staff Request
         if path.endswith("/frappe_client_portal.api.requests.reply_request"):
@@ -283,15 +401,15 @@ def run():
     server_address = ("", PORT)
     httpd = HTTPServer(server_address, FrappeApiHandler)
     print("=" * 60)
-    print(f"🚀 Frappe Client Portal Local Dev Server Running!")
-    print(f"📍 Address: http://localhost:{PORT}")
-    print(f"🔗 Connected to React Frontend: http://localhost:5173")
-    print(f"Press Ctrl+C to stop the server.")
+    print("[SERVER] Frappe Client Portal Local Dev Server Running!")
+    print(f"[SERVER] Address: http://localhost:{PORT}")
+    print(f"[SERVER] Connected to React Frontend: http://localhost:5173")
+    print(f"[SERVER] Demo Accounts Ready: owner@northstar.co.uk | bookkeeper@northstar.co.uk | payroll@northstar.co.uk")
     print("=" * 60)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n🛑 Server stopped.")
+        print("\n[SERVER] Server stopped.")
 
 if __name__ == "__main__":
     run()
