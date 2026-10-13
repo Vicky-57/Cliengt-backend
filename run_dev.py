@@ -1,513 +1,755 @@
 """
-Standalone Local Development Server for Frappe Client Portal Backend
-Runs directly on Windows without requiring WSL or Frappe Bench setup.
-Serves Frappe API endpoints on port 8000 with CORS enabled for Vite frontend (5173).
-Includes real 2FA OTP generation and verification, submissions engine, requests & helpdesk.
+Frappe Client Portal - Local Dev Server (SQLite backed)
+
+* Persistent data in dev.db (next to this file)
+* Token auth (Authorization: Bearer <token>)
+* Every business record is scoped to a company; the caller must be a member
+  of the company named in the X-Company header.
+* Two seeded users with NO companies / NO data.
+
+Run:  python run_dev.py
 """
-
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
-import urllib.parse
-import os
 import datetime
+import hashlib
+import json
+import os
 import random
-import sys
-
-# Ensure UTF-8 output on Windows
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+import secrets
+import sqlite3
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8000
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "dev.db")
+FRONTEND_ORIGIN = "http://localhost:5173"
 
-DEMO_USERS = {
-    "vikaspurohit105@gmail.com": {
-        "name": "Vikas Purohit",
-        "role": "Owner",
-        "company": "Northstar Creative Ltd",
-        "password": "Password123!",
-        "phone": "+44 7700 900123"
-    },
-    "owner@northstar.co.uk": {
-        "name": "Sarah Mitchell",
-        "role": "Owner",
-        "company": "Northstar Creative Ltd",
-        "password": "Password123!",
-        "phone": "+44 7700 900456"
-    },
-    "bookkeeper@northstar.co.uk": {
-        "name": "Priya Nair",
-        "role": "Bookkeeping",
-        "company": "Northstar Creative Ltd",
-        "password": "Password123!",
-        "phone": "+44 7700 900789"
-    },
-    "payroll@northstar.co.uk": {
-        "name": "Mike Ross",
-        "role": "Payroll",
-        "company": "Northstar Creative Ltd",
-        "password": "Password123!",
-        "phone": "+44 7700 900321"
+ENABLE_2FA = os.environ.get("ENABLE_2FA", "false").lower() == "true"
+ENABLE_DEV_STAFF = os.environ.get("ENABLE_DEV_STAFF", "true").lower() == "true"
+
+SEED_USERS = [
+    ("alice.test@portal.dev", "Alice Walker", "Test@1234"),
+    ("bob.test@portal.dev", "Bob Turner", "Test@1234"),
+]
+
+OTPS = {}  # in-memory, only used when ENABLE_2FA is on
+
+
+# ─────────────────────────────── DB ───────────────────────────────
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def hash_pw(password, salt=None):
+    salt = salt or secrets.token_hex(8)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+    return f"{salt}${digest}"
+
+
+def check_pw(password, stored):
+    try:
+        salt, _ = stored.split("$", 1)
+    except ValueError:
+        return False
+    return secrets.compare_digest(hash_pw(password, salt), stored)
+
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def init_db():
+    conn = db()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users(
+            email TEXT PRIMARY KEY, full_name TEXT, password_hash TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS sessions(
+            token TEXT PRIMARY KEY, user_email TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS companies(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, company_number TEXT,
+            type TEXT, address TEXT, vat_number TEXT, year_end TEXT, phone TEXT,
+            email TEXT, created_by TEXT, created_at TEXT,
+            onboarding_step INTEGER DEFAULT 1, onboarding_completed INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS company_members(
+            company_id INTEGER, user_email TEXT, role TEXT, status TEXT DEFAULT 'Active',
+            PRIMARY KEY(company_id, user_email));
+        CREATE TABLE IF NOT EXISTS submissions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT, company_id INTEGER,
+            submission_type TEXT, status TEXT, period TEXT, submitted_by TEXT,
+            notes TEXT, total_gross REAL DEFAULT 0, items TEXT, files TEXT,
+            created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT, company_id INTEGER,
+            submission_ref TEXT, title TEXT, message TEXT, due_date TEXT,
+            status TEXT DEFAULT 'Pending', assigned_to TEXT, client_reply TEXT,
+            created_at TEXT);
+        CREATE TABLE IF NOT EXISTS queries(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT, company_id INTEGER,
+            subject TEXT, category TEXT, status TEXT DEFAULT 'Open',
+            assigned_to TEXT DEFAULT 'Unassigned', created_by TEXT,
+            created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS query_messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, query_id INTEGER, sender TEXT,
+            is_staff INTEGER DEFAULT 0, body TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS tasks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT, company_id INTEGER,
+            title TEXT, due_date TEXT, priority TEXT DEFAULT 'Medium',
+            status TEXT DEFAULT 'Open', created_at TEXT);
+        CREATE TABLE IF NOT EXISTS notifications(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, user_email TEXT,
+            title TEXT, body TEXT, is_read INTEGER DEFAULT 0, created_at TEXT);
+        """
+    )
+    for email, name, pwd in SEED_USERS:
+        if not conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+            conn.execute(
+                "INSERT INTO users VALUES(?,?,?,?)", (email, name, hash_pw(pwd), now())
+            )
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────── helpers ───────────────────────────────
+class ApiError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def company_dict(row, role=None):
+    d = dict(row)
+    d["onboarding_completed"] = bool(d.get("onboarding_completed"))
+    if role:
+        d["role"] = role
+    return d
+
+
+def days_until(date_str):
+    try:
+        d = datetime.datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+        return (d - datetime.date.today()).days
+    except Exception:
+        return None
+
+
+def rel_time(ts):
+    try:
+        t = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ts or ""
+    delta = datetime.datetime.now() - t
+    if delta.total_seconds() < 60:
+        return "Just now"
+    if t.date() == datetime.date.today():
+        return "Today, " + t.strftime("%I:%M %p").lstrip("0")
+    if t.date() == datetime.date.today() - datetime.timedelta(days=1):
+        return "Yesterday, " + t.strftime("%I:%M %p").lstrip("0")
+    return t.strftime("%d %b %Y")
+
+
+def sub_to_api(r):
+    d = dict(r)
+    return {
+        "name": d["ref"],
+        "submission_type": d["submission_type"],
+        "status": d["status"],
+        "period": d["period"],
+        "submitted_by": d["submitted_by"],
+        "total_gross": d["total_gross"],
+        "creation": d["created_at"],
+        "modified": d["updated_at"],
+        "notes": d["notes"],
+        "items": json.loads(d["items"] or "[]"),
+        "files": json.loads(d["files"] or "[]"),
     }
-}
 
-# In-memory dynamic test state
-STATE = {
-    "user": {
-        "email": "vikaspurohit105@gmail.com",
-        "first_name": "Vikas",
-        "last_name": "Purohit",
-        "full_name": "Vikas Purohit"
-    },
-    "company": {
-        "name": "Northstar Creative Ltd",
-        "email": "finance@northstarcreative.co.uk",
-        "phone": "+44 20 7946 0842",
-        "company_number": "09284117",
-        "vat_number": "GB 217 8494 31",
-        "registered_address": "41 Clerkenwell Road, London, EC1M 5RS",
-        "trading_address": "Unit 8, The Loom, London, E1 1DU",
-        "bank_name": "Monzo Business",
-        "account_number": "34891234",
-        "account_number_masked": "•••• 1234",
-        "sort_code": "40-08-41",
-        "sort_code_masked": "•••• 41",
-        "status": "Active"
-    },
-    "role": "Owner",
-    "active_otps": {},
-    "submissions": [
-        {
-            "name": "REF-1042",
-            "submission_type": "Sales Invoice",
-            "status": "Submitted",
-            "period": "Oct 2026",
-            "submitted_by": "Vikas Purohit",
-            "total_gross": 2400.0,
-            "creation": "2026-10-08 14:30:00",
-            "modified": "2026-10-08 14:30:00",
-            "notes": "Acme Corp INV-0042",
-            "items": [
-                {
-                    "date": "2026-10-08",
-                    "supplier_customer": "Acme Corp",
-                    "description": "Consulting Services Q3",
-                    "category": "Sales",
-                    "net_amount": 2000.0,
-                    "vat_rate": 20.0,
-                    "vat_amount": 400.0,
-                    "total_amount": 2400.0
-                }
-            ]
-        },
-        {
-            "name": "REF-1041",
-            "submission_type": "Expense Claim",
-            "status": "Needs Info",
-            "period": "Oct 2026",
-            "submitted_by": "Mike Ross",
-            "total_gross": 142.50,
-            "creation": "2026-10-05 09:15:00",
-            "modified": "2026-10-06 11:20:00",
-            "notes": "Train ticket to London",
-            "items": [
-                {
-                    "date": "2026-10-05",
-                    "supplier_customer": "LNER Trains",
-                    "description": "Off-peak travel to client meeting",
-                    "category": "Travel",
-                    "net_amount": 118.75,
-                    "vat_rate": 20.0,
-                    "vat_amount": 23.75,
-                    "total_amount": 142.50
-                }
-            ]
-        },
-        {
-            "name": "REF-1040",
-            "submission_type": "Bookkeeping Batch",
-            "status": "Processed",
-            "period": "Oct 2026",
-            "submitted_by": "Priya Nair",
-            "total_gross": 1850.0,
-            "creation": "2026-10-01 10:00:00",
-            "modified": "2026-10-02 16:40:00",
-            "notes": "Monthly office rent",
-            "items": []
-        }
-    ],
-    "requests": [
-        {
-            "name": "RQ-001",
-            "submission": "REF-1041",
-            "title": "Missing VAT Receipt for Trainline",
-            "message": "Hi Vikas, the attachment for REF-1041 is just a booking confirmation. Please attach the tax receipt showing the VAT breakdown.",
-            "due_date": "2026-10-15",
-            "days_left": 2,
-            "is_urgent": 1,
-            "status": "Pending",
-            "assigned_to": "Alex Morgan",
-            "client_reply": None
-        }
-    ],
-    "queries": [
-        {
-            "id": "HD-2045",
-            "subject": "Tax code discrepancy on September invoice",
-            "category": "Tax",
-            "status": "Replied",
-            "updated": "Today, 10:45 AM",
-            "assigned": "Sarah Jenkins",
-            "message": "We noticed a discrepancy in the tax code applied on the INV-0042 draft."
-        },
-        {
-            "id": "HD-2044",
-            "subject": "Question regarding travel expense VAT",
-            "category": "Expenses",
-            "status": "Open",
-            "updated": "Yesterday, 3:20 PM",
-            "assigned": "Unassigned",
-            "message": "Can we reclaim VAT on international train bookings?"
-        }
-    ]
-}
 
-class FrappeApiHandler(BaseHTTPRequestHandler):
-    def _send_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "http://localhost:5173")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+def req_to_api(r):
+    d = dict(r)
+    left = days_until(d["due_date"]) if d["due_date"] else None
+    return {
+        "name": d["ref"],
+        "submission": d["submission_ref"],
+        "title": d["title"],
+        "message": d["message"],
+        "due_date": d["due_date"],
+        "days_left": left if left is not None else 7,
+        "is_urgent": 1 if (left is not None and left <= 3) else 0,
+        "status": d["status"],
+        "assigned_to": d["assigned_to"] or "Accounting Team",
+        "client_reply": d["client_reply"],
+    }
+
+
+def query_to_api(r):
+    d = dict(r)
+    return {
+        "id": d["ref"],
+        "subject": d["subject"],
+        "category": d["category"],
+        "status": d["status"],
+        "updated": rel_time(d["updated_at"]),
+        "assigned": d["assigned_to"],
+        "created_by": d["created_by"],
+    }
+
+
+def initials(name):
+    return "".join(p[0] for p in (name or "").split()[:2]).upper() or "AC"
+
+
+# ─────────────────────────────── handler ───────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    server_version = "PortalDev/2.0"
+
+    # ---- plumbing
+    def log_message(self, fmt, *args):
+        pass
+
+    def _cors(self):
+        origin = self.headers.get("Origin") or FRONTEND_ORIGIN
+        self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Credentials", "true")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Company, Accept")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Vary", "Origin")
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self._send_cors_headers()
+        self.send_response(204)
+        self._cors()
         self.end_headers()
 
-    def _send_json(self, data, status_code=200):
-        self.send_response(status_code)
+    def _send(self, data, status=200):
+        raw = json.dumps(data, default=str).encode()
+        self.send_response(status)
+        self._cors()
         self.send_header("Content-Type", "application/json")
-        self._send_cors_headers()
+        self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(raw)
 
-    def _read_body(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length > 0:
-            body_bytes = self.rfile.read(content_length)
+    def _args(self, parsed):
+        args = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
             try:
-                return json.loads(body_bytes.decode("utf-8"))
+                body = json.loads(self.rfile.read(length).decode() or "{}")
+                if isinstance(body, dict):
+                    args.update(body)
             except Exception:
-                return {}
-        return {}
+                raise ApiError("Invalid JSON body")
+        return args
+
+    def _user(self, conn, required=True):
+        auth = self.headers.get("Authorization", "")
+        token = auth.split(" ", 1)[1] if auth.startswith("Bearer ") else ""
+        row = None
+        if token:
+            row = conn.execute(
+                "SELECT u.* FROM sessions s JOIN users u ON u.email=s.user_email WHERE s.token=?",
+                (token,),
+            ).fetchone()
+        if not row and required:
+            raise ApiError("Not authenticated. Please sign in.", 401)
+        return row
+
+    def _company(self, conn, user):
+        """Resolve and authorise the active company (X-Company header)."""
+        cid = self.headers.get("X-Company")
+        if not cid or not str(cid).isdigit():
+            raise ApiError("No active company selected.", 400)
+        m = conn.execute(
+            "SELECT * FROM company_members WHERE company_id=? AND user_email=?",
+            (int(cid), user["email"]),
+        ).fetchone()
+        if not m:
+            raise ApiError("You are not a member of this company.", 403)
+        return int(cid), m["role"]
+
+    def _dispatch(self):
+        parsed = urllib.parse.urlparse(self.path)
+        method = parsed.path.rsplit("/", 1)[-1]
+        try:
+            args = self._args(parsed)
+            conn = db()
+            try:
+                short = method.split("frappe_client_portal.api.")[-1].replace(".", "_")
+                fn = getattr(self, "api_" + short, None)
+                if not fn:
+                    raise ApiError(f"Unknown method: {method}", 404)
+                result = fn(conn, args)
+                conn.commit()
+                return self._send(result)
+            finally:
+                conn.close()
+        except ApiError as e:
+            return self._send({"status": "error", "message": e.message}, e.status)
+        except Exception as e:  # pragma: no cover
+            import traceback
+            traceback.print_exc()
+            return self._send({"status": "error", "message": f"Server error: {e}"}, 500)
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
-
-        # 1. get_current_user
-        if path.endswith("/frappe_client_portal.api.auth.get_current_user"):
-            return self._send_json({
-                "status": "success",
-                "data": {
-                    "user": STATE["user"]["email"],
-                    "name": STATE["user"]["full_name"],
-                    "email": STATE["user"]["email"],
-                    "company": STATE["company"]["name"],
-                    "company_details": STATE["company"],
-                    "role": STATE["role"],
-                    "portal_role": STATE["role"]
-                }
-            })
-
-        # 2. get_dashboard_summary (Dynamic real counts & tasks)
-        if path.endswith("/frappe_client_portal.api.dashboard.get_dashboard_summary"):
-            counts = {
-                "submitted": sum(1 for s in STATE["submissions"] if s["status"] == "Submitted"),
-                "received": sum(1 for s in STATE["submissions"] if s["status"] == "Received"),
-                "in_review": sum(1 for s in STATE["submissions"] if s["status"] == "In Review"),
-                "needs_info": sum(1 for s in STATE["submissions"] if s["status"] == "Needs Info"),
-                "processed": sum(1 for s in STATE["submissions"] if s["status"] == "Processed"),
-                "rejected": sum(1 for s in STATE["submissions"] if s["status"] == "Rejected")
-            }
-            pending_requests = [r for r in STATE["requests"] if r["status"] == "Pending"]
-            return self._send_json({
-                "status": "success",
-                "data": {
-                    "counts": counts,
-                    "urgent_requests": pending_requests,
-                    "upcoming_tasks": [
-                        {"name": "TSK-01", "title": "VAT Return Q3 Review", "due_date": "2026-11-07", "days_remaining": 25, "priority": "Urgent", "status": "In Progress"},
-                        {"name": "TSK-02", "title": "Annual Accounts Preparation", "due_date": "2026-12-31", "days_remaining": 79, "priority": "High", "status": "Open"}
-                    ],
-                    "open_queries_count": len([q for q in STATE["queries"] if q["status"] != "Closed"])
-                }
-            })
-
-        # 3. get_submissions
-        if path.endswith("/frappe_client_portal.api.submissions.get_submissions"):
-            sub_type = query.get("submission_type", [""])[0]
-            status = query.get("status", [""])[0]
-            period = query.get("period", [""])[0]
-            search = query.get("search", [""])[0].lower()
-
-            results = list(STATE["submissions"])
-            if sub_type:
-                results = [s for s in results if s.get("submission_type") == sub_type]
-            if status:
-                results = [s for s in results if s.get("status") == status]
-            if period:
-                results = [s for s in results if s.get("period") == period]
-            if search:
-                results = [s for s in results if search in s.get("name", "").lower() or search in s.get("notes", "").lower()]
-
-            return self._send_json({
-                "status": "success",
-                "data": results,
-                "total": len(results)
-            })
-
-        # 4. get_submission_detail
-        if path.endswith("/frappe_client_portal.api.submissions.get_submission_detail"):
-            ref = query.get("reference", [""])[0]
-            sub = next((s for s in STATE["submissions"] if s["name"] == ref), None)
-            if sub:
-                sub_dict = dict(sub)
-                sub_dict["staff_requests"] = [r for r in STATE["requests"] if r.get("submission") == ref]
-                return self._send_json({"status": "success", "data": sub_dict})
-            return self._send_json({"status": "error", "message": "Not found"}, 404)
-
-        # 5. get_requests
-        if path.endswith("/frappe_client_portal.api.requests.get_requests"):
-            req_status = query.get("status", [""])[0]
-            reqs = STATE["requests"]
-            if req_status:
-                reqs = [r for r in reqs if r["status"] == req_status]
-            return self._send_json({
-                "status": "success",
-                "data": reqs
-            })
-
-        # 6. get_queries
-        if path.endswith("/frappe_client_portal.api.queries.get_queries"):
-            return self._send_json({
-                "status": "success",
-                "data": STATE["queries"]
-            })
-
-        # 7. get_company_profile
-        if path.endswith("/frappe_client_portal.api.company.get_company_profile"):
-            return self._send_json({
-                "status": "success",
-                "data": STATE["company"]
-            })
-
-        # 8. get_team_members
-        if path.endswith("/frappe_client_portal.api.team.get_team_members"):
-            return self._send_json({
-                "status": "success",
-                "data": [
-                    {"name": "LINK-01", "user": "vikaspurohit105@gmail.com", "name_display": "Vikas Purohit", "portal_role": "Owner", "status": "Active", "last_login": "Today, 17:30"},
-                    {"name": "LINK-02", "user": "owner@northstar.co.uk", "name_display": "Sarah Mitchell", "portal_role": "Owner", "status": "Active", "last_login": "Today, 14:00"},
-                    {"name": "LINK-03", "user": "bookkeeper@northstar.co.uk", "name_display": "Priya Nair", "portal_role": "Bookkeeping", "status": "Active", "last_login": "Yesterday, 09:15"},
-                    {"name": "LINK-04", "user": "payroll@northstar.co.uk", "name_display": "Mike Ross", "portal_role": "Payroll", "status": "Active", "last_login": "05 Oct 2026"}
-                ]
-            })
-
-        # Fallback
-        self._send_json({"status": "success", "message": "Dev Server OK", "path": path})
+        self._dispatch()
 
     def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-        body = self._read_body()
+        self._dispatch()
 
-        # Login
-        if path.endswith("/frappe_client_portal.api.auth.login"):
-            usr = body.get("usr", "").strip().lower()
-            pwd = body.get("pwd", "")
+    # ─────────────── auth ───────────────
+    def _user_payload(self, conn, user):
+        comps = conn.execute(
+            "SELECT c.*, m.role FROM companies c JOIN company_members m ON m.company_id=c.id "
+            "WHERE m.user_email=? ORDER BY c.id",
+            (user["email"],),
+        ).fetchall()
+        return {
+            "user": user["email"],
+            "email": user["email"],
+            "name": user["full_name"],
+            "full_name": user["full_name"],
+            "companies": [company_dict(c, c["role"]) for c in comps],
+        }
 
-            matched = DEMO_USERS.get(usr)
-            if not matched:
-                return self._send_json({
-                    "status": "error",
-                    "message": "Invalid email address. Please use vikaspurohit105@gmail.com or one of the demo accounts."
-                }, 401)
-            
-            if pwd != matched["password"]:
-                return self._send_json({
-                    "status": "error",
-                    "message": "Invalid password. The account password is Password123!"
-                }, 401)
-            
-            STATE["user"]["email"] = usr
-            STATE["user"]["full_name"] = matched["name"]
-            STATE["role"] = matched["role"]
-            STATE["company"]["name"] = matched["company"]
+    def api_auth_login(self, conn, a):
+        usr = (a.get("usr") or "").strip().lower()
+        pwd = a.get("pwd") or ""
+        user = conn.execute("SELECT * FROM users WHERE email=?", (usr,)).fetchone()
+        if not user or not check_pw(pwd, user["password_hash"]):
+            raise ApiError("Incorrect email or password.", 401)
+        token = secrets.token_urlsafe(32)
+        conn.execute("INSERT INTO sessions VALUES(?,?,?)", (token, usr, now()))
+        out = {"status": "success", "message": "Logged In", "token": token,
+               "two_factor_required": ENABLE_2FA}
+        out.update(self._user_payload(conn, user))
+        if ENABLE_2FA:
+            code = str(random.randint(100000, 999999))
+            OTPS[usr] = code
+            print(f"[2FA] code for {usr}: {code}")
+            out["otp"] = code
+        return out
 
-            # Generate 2FA code
-            otp_code = str(random.randint(100000, 999999))
-            STATE["active_otps"][usr] = otp_code
-            print(f"[2FA AUTH] >>> Sent 6-digit verification code: {otp_code} to {usr} <<<")
-            
-            return self._send_json({
-                "status": "success",
-                "message": "Logged In",
-                "user": usr,
-                "full_name": matched["name"],
-                "company": matched["company"],
-                "role": matched["role"],
-                "portal_role": matched["role"],
-                "two_factor_required": True,
-                "otp": otp_code
-            })
+    def api_auth_logout(self, conn, a):
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            conn.execute("DELETE FROM sessions WHERE token=?", (auth.split(" ", 1)[1],))
+        return {"status": "success", "message": "Logged Out"}
 
-        # Send 2FA OTP Code
-        if path.endswith("/frappe_client_portal.api.auth.send_otp"):
-            usr = body.get("usr", "").strip().lower() or STATE["user"]["email"]
-            otp_code = str(random.randint(100000, 999999))
-            STATE["active_otps"][usr] = otp_code
-            print(f"[2FA AUTH] >>> Dispatched 6-digit verification code: {otp_code} to {usr} <<<")
-            return self._send_json({
-                "status": "success",
-                "message": f"Verification code sent to {usr}",
-                "otp": otp_code,
-                "email": usr
-            })
+    def api_auth_get_current_user(self, conn, a):
+        user = self._user(conn)
+        out = {"status": "success"}
+        out.update(self._user_payload(conn, user))
+        return out
 
-        # Verify 2FA OTP Code
-        if path.endswith("/frappe_client_portal.api.auth.verify_otp"):
-            usr = body.get("usr", "").strip().lower() or STATE["user"]["email"]
-            code = str(body.get("code", "")).strip()
-            valid_code = STATE.get("active_otps", {}).get(usr)
-            if code == valid_code or code == "123456":
-                return self._send_json({
-                    "status": "success",
-                    "message": "2FA verification successful",
-                    "verified": True,
-                    "user": usr
-                })
-            return self._send_json({
-                "status": "error",
-                "message": "Invalid 2FA code. Please enter the code sent to your email or use 123456."
-            }, 400)
+    def api_auth_send_otp(self, conn, a):
+        usr = (a.get("usr") or "").strip().lower()
+        code = str(random.randint(100000, 999999))
+        OTPS[usr] = code
+        print(f"[2FA] code for {usr}: {code}")
+        return {"status": "success", "otp": code, "email": usr}
 
-        # Logout
-        if path.endswith("/frappe_client_portal.api.auth.logout"):
-            return self._send_json({"status": "success", "message": "Logged Out"})
+    def api_auth_verify_otp(self, conn, a):
+        usr = (a.get("usr") or "").strip().lower()
+        code = str(a.get("code", "")).strip()
+        if code == OTPS.get(usr) or code == "123456":
+            return {"status": "success", "verified": True, "user": usr}
+        raise ApiError("Invalid verification code.", 400)
 
-        # Submit Expense Claim
-        if path.endswith("/frappe_client_portal.api.submissions.submit_expense_claim"):
-            ref = f"REF-{1043 + len(STATE['submissions'])}"
-            items = body.get("items", [])
-            if isinstance(items, str):
-                items = json.loads(items)
-            total = sum(float(i.get("total_amount", 0) or 0) for i in items)
-            new_sub = {
-                "name": ref,
-                "submission_type": "Expense Claim",
-                "status": "Submitted",
-                "period": body.get("period", "Oct 2026"),
-                "submitted_by": STATE["user"]["full_name"],
-                "total_gross": total,
-                "creation": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "modified": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "notes": body.get("notes", ""),
-                "items": items
-            }
-            STATE["submissions"].insert(0, new_sub)
-            return self._send_json({"status": "success", "reference": ref})
+    # ─────────────── companies ───────────────
+    def api_company_get_my_companies(self, conn, a):
+        user = self._user(conn)
+        return {"status": "success", "data": self._user_payload(conn, user)["companies"]}
 
-        # Batch Upload Documents
-        if path.endswith("/frappe_client_portal.api.submissions.upload_documents"):
-            category = body.get("category", "Document")
-            period = body.get("period", "Oct 2026")
-            file_urls = body.get("file_urls") or body.get("fileUrls") or []
-            if isinstance(file_urls, str):
-                try:
-                    file_urls = json.loads(file_urls)
-                except Exception:
-                    file_urls = [file_urls]
-            
-            if not file_urls:
-                file_urls = ["Uploaded_Document.pdf"]
-            
-            ref = f"DOC-{1050 + len(STATE['submissions'])}"
-            created_docs = []
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def api_company_create_company(self, conn, a):
+        user = self._user(conn)
+        data = a.get("data") if isinstance(a.get("data"), dict) else a
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise ApiError("Company name is required.")
+        cur = conn.execute(
+            "INSERT INTO companies(name,company_number,type,address,vat_number,year_end,phone,email,"
+            "created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (name, data.get("company_number", ""), data.get("type", "Limited Company"),
+             data.get("address", ""), data.get("vat_number", ""), data.get("year_end", ""),
+             data.get("phone", ""), data.get("email", user["email"]), user["email"], now()),
+        )
+        cid = cur.lastrowid
+        conn.execute("INSERT INTO company_members(company_id,user_email,role) VALUES(?,?,?)",
+                     (cid, user["email"], "Owner"))
+        row = conn.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone()
+        return {"status": "success", "data": company_dict(row, "Owner")}
 
-            for item in file_urls:
-                doc_name = item.get("name", "Document.pdf") if isinstance(item, dict) else str(item)
-                new_sub = {
-                    "name": ref,
-                    "submission_type": category,
-                    "status": "Submitted",
-                    "period": period,
-                    "submitted_by": STATE["user"]["full_name"],
-                    "total_gross": 0.0,
-                    "creation": now_str,
-                    "modified": now_str,
-                    "notes": doc_name,
-                    "items": []
-                }
-                STATE["submissions"].insert(0, new_sub)
-                created_docs.append(new_sub)
+    def api_company_get_company_profile(self, conn, a):
+        user = self._user(conn)
+        cid, role = self._company(conn, user)
+        row = conn.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone()
+        return {"status": "success", "data": company_dict(row, role)}
 
-            return self._send_json({
-                "status": "success",
-                "reference": ref,
-                "message": f"Successfully uploaded {len(created_docs)} file(s)",
-                "data": STATE["submissions"]
-            })
+    def api_company_update_company_profile(self, conn, a):
+        user = self._user(conn)
+        cid, role = self._company(conn, user)
+        if role not in ("Owner", "Admin"):
+            raise ApiError("Only owners can edit the company profile.", 403)
+        data = a.get("data") if isinstance(a.get("data"), dict) else {}
+        allowed = {"name", "company_number", "type", "address", "vat_number", "year_end", "phone", "email"}
+        for k, v in data.items():
+            if k in allowed:
+                conn.execute(f"UPDATE companies SET {k}=? WHERE id=?", (v, cid))
+        return {"status": "success", "message": "Company profile updated"}
 
-        # Reply to Staff Request
-        if path.endswith("/frappe_client_portal.api.requests.reply_request"):
-            req_id = body.get("request_id") or body.get("requestId")
-            reply_text = body.get("reply_text") or body.get("replyText")
-            for r in STATE["requests"]:
-                if r["name"] == req_id:
-                    r["status"] = "Completed"
-                    r["client_reply"] = reply_text
-            return self._send_json({"status": "success", "message": "Reply sent successfully"})
+    def api_company_save_onboarding_step(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        step = int(a.get("step") or 1)
+        done = 1 if a.get("completed") in (True, "true", 1, "1") else 0
+        conn.execute("UPDATE companies SET onboarding_step=?, onboarding_completed=? WHERE id=?",
+                     (step, done, cid))
+        return {"status": "success"}
 
-        # Create New Query (Helpdesk)
-        if path.endswith("/frappe_client_portal.api.queries.create_query"):
-            new_id = f"HD-{2046 + len(STATE['queries'])}"
-            new_q = {
-                "id": new_id,
-                "subject": body.get("subject", "General Inquiry"),
-                "category": body.get("category", "General"),
-                "status": "Open",
-                "updated": "Just now",
-                "assigned": "Accounting Team",
-                "message": body.get("message", "")
-            }
-            STATE["queries"].insert(0, new_q)
-            return self._send_json({"status": "success", "data": new_q})
+    # ─────────────── dashboard ───────────────
+    def api_dashboard_get_dashboard_summary(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
 
-        # Update company profile
-        if path.endswith("/frappe_client_portal.api.company.update_company_profile"):
-            data = body.get("data", {})
-            STATE["company"].update(data)
-            return self._send_json({"status": "success", "message": "Company profile updated"})
+        def count(status):
+            return conn.execute(
+                "SELECT COUNT(*) FROM submissions WHERE company_id=? AND status=?", (cid, status)
+            ).fetchone()[0]
 
-        self._send_json({"status": "success", "message": "Action completed", "path": path})
+        reqs = [req_to_api(r) for r in conn.execute(
+            "SELECT * FROM requests WHERE company_id=? AND status='Pending' ORDER BY due_date", (cid,))]
+        tasks = []
+        for t in conn.execute(
+                "SELECT * FROM tasks WHERE company_id=? AND status!='Done' ORDER BY due_date", (cid,)):
+            left = days_until(t["due_date"]) if t["due_date"] else None
+            tasks.append({"name": t["ref"], "title": t["title"], "due_date": t["due_date"],
+                          "days_remaining": left if left is not None else 0,
+                          "priority": t["priority"], "status": t["status"]})
+        open_q = conn.execute(
+            "SELECT COUNT(*) FROM queries WHERE company_id=? AND status!='Closed'", (cid,)).fetchone()[0]
+        activity = []
+        for r in conn.execute(
+                "SELECT * FROM submissions WHERE company_id=? ORDER BY id DESC LIMIT 5", (cid,)):
+            activity.append({"type": "submission", "text": f"{r['submission_type']} {r['ref']} is {r['status']}",
+                             "time": rel_time(r["updated_at"])})
+        return {"status": "success", "data": {
+            "counts": {"submitted": count("Submitted"), "received": count("Received"),
+                       "in_review": count("In Review"), "needs_info": count("Needs Info"),
+                       "processed": count("Processed"), "rejected": count("Rejected")},
+            "urgent_requests": reqs, "upcoming_tasks": tasks,
+            "open_queries_count": open_q, "recent_activity": activity}}
+
+    # ─────────────── submissions ───────────────
+    def _new_ref(self, conn, table, prefix):
+        n = conn.execute(f"SELECT COALESCE(MAX(id),0)+1 FROM {table}").fetchone()[0]
+        return f"{prefix}-{datetime.date.today().year}-{n:06d}"
+
+    def _create_submission(self, conn, user, cid, stype, prefix, a, items=None, total=0, files=None):
+        ref = self._new_ref(conn, "submissions", prefix)
+        ts = now()
+        conn.execute(
+            "INSERT INTO submissions(ref,company_id,submission_type,status,period,submitted_by,notes,"
+            "total_gross,items,files,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ref, cid, stype, "Submitted", a.get("period", ""), user["full_name"], a.get("notes", ""),
+             total, json.dumps(items or []), json.dumps(files or []), ts, ts))
+        return ref
+
+    def _as_list(self, v):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                v = [v]
+        return v or []
+
+    def api_submissions_get_submissions(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        sql, p = "SELECT * FROM submissions WHERE company_id=?", [cid]
+        if a.get("submission_type"):
+            sql += " AND submission_type=?"
+            p.append(a["submission_type"])
+        if a.get("status"):
+            sql += " AND status=?"
+            p.append(a["status"])
+        if a.get("period"):
+            sql += " AND period=?"
+            p.append(a["period"])
+        if a.get("search"):
+            sql += " AND (ref LIKE ? OR notes LIKE ?)"
+            p += [f"%{a['search']}%"] * 2
+        sql += " ORDER BY id DESC"
+        return {"status": "success", "data": [sub_to_api(r) for r in conn.execute(sql, p)]}
+
+    def api_submissions_get_submission_detail(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        r = conn.execute("SELECT * FROM submissions WHERE company_id=? AND ref=?",
+                         (cid, a.get("reference"))).fetchone()
+        if not r:
+            raise ApiError("Submission not found.", 404)
+        d = sub_to_api(r)
+        d["staff_requests"] = [req_to_api(x) for x in conn.execute(
+            "SELECT * FROM requests WHERE company_id=? AND submission_ref=?", (cid, r["ref"]))]
+        return {"status": "success", "data": d}
+
+    def api_submissions_submit_expense_claim(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        items = self._as_list(a.get("items"))
+        total = sum(float(i.get("total_amount", 0) or 0) for i in items if isinstance(i, dict))
+        ref = self._create_submission(conn, user, cid, "Expense Claim", "EXP", a, items, total)
+        return {"status": "success", "reference": ref}
+
+    def api_submissions_submit_sales_invoice(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        items = self._as_list(a.get("items"))
+        total = float(a.get("total_amount") or a.get("total") or 0)
+        ref = self._create_submission(conn, user, cid, "Sales Invoice", "INV", a, items, total)
+        return {"status": "success", "reference": ref}
+
+    def api_submissions_submit_payroll(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        entries = self._as_list(a.get("entries"))
+        ref = self._create_submission(conn, user, cid, "Payroll", "PAY", a, entries)
+        return {"status": "success", "reference": ref}
+
+    def api_submissions_upload_documents(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        files = self._as_list(a.get("file_urls") or a.get("fileUrls"))
+        if not files:
+            raise ApiError("No files provided.")
+        names = [f.get("name") if isinstance(f, dict) else str(f) for f in files]
+        notes = a.get("notes", "")
+        a = dict(a)
+        a["notes"] = (notes + " " if notes else "") + ", ".join(names)
+        ref = self._create_submission(conn, user, cid, a.get("category", "Document"), "DOC", a,
+                                      files=[{"name": n} for n in names])
+        return {"status": "success", "reference": ref, "message": f"Uploaded {len(names)} file(s)"}
+
+    def api_submissions_withdraw_submission(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        conn.execute("DELETE FROM submissions WHERE company_id=? AND ref=? AND status='Submitted'",
+                     (cid, a.get("reference")))
+        return {"status": "success"}
+
+    # ─────────────── requests ───────────────
+    def api_requests_get_requests(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        status = a.get("status")
+        sql, p = "SELECT * FROM requests WHERE company_id=?", [cid]
+        if status and status != "All":
+            sql += " AND status=?"
+            p.append(status)
+        sql += " ORDER BY id DESC"
+        return {"status": "success", "data": [req_to_api(r) for r in conn.execute(sql, p)]}
+
+    def api_requests_reply_request(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        rid = a.get("request_id") or a.get("requestId")
+        r = conn.execute("SELECT * FROM requests WHERE company_id=? AND ref=?", (cid, rid)).fetchone()
+        if not r:
+            raise ApiError("Request not found.", 404)
+        conn.execute("UPDATE requests SET status='Completed', client_reply=? WHERE id=?",
+                     (a.get("reply_text") or a.get("replyText") or "", r["id"]))
+        conn.execute("UPDATE submissions SET status='In Review', updated_at=? "
+                     "WHERE company_id=? AND ref=? AND status='Needs Info'", (now(), cid, r["submission_ref"]))
+        return {"status": "success", "message": "Reply sent successfully"}
+
+    # ─────────────── queries (helpdesk) ───────────────
+    def api_queries_get_queries(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        rows = conn.execute("SELECT * FROM queries WHERE company_id=? ORDER BY id DESC", (cid,)).fetchall()
+        out = []
+        for r in rows:
+            d = query_to_api(r)
+            last = conn.execute("SELECT * FROM query_messages WHERE query_id=? ORDER BY id DESC LIMIT 1",
+                                (r["id"],)).fetchone()
+            d["message"] = last["body"] if last else ""
+            d["has_staff_reply"] = bool(last and last["is_staff"])
+            out.append(d)
+        return {"status": "success", "data": out}
+
+    def api_queries_get_query_detail(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        r = conn.execute("SELECT * FROM queries WHERE company_id=? AND ref=?", (cid, a.get("id"))).fetchone()
+        if not r:
+            raise ApiError("Query not found.", 404)
+        d = query_to_api(r)
+        d["messages"] = [{"sender": m["sender"], "is_staff": bool(m["is_staff"]), "body": m["body"],
+                          "time": rel_time(m["created_at"])}
+                         for m in conn.execute("SELECT * FROM query_messages WHERE query_id=? ORDER BY id",
+                                               (r["id"],))]
+        return {"status": "success", "data": d}
+
+    def api_queries_create_query(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        subject = (a.get("subject") or "").strip()
+        if not subject:
+            raise ApiError("Subject is required.")
+        ref = self._new_ref(conn, "queries", "HD")
+        ts = now()
+        cur = conn.execute(
+            "INSERT INTO queries(ref,company_id,subject,category,created_by,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)", (ref, cid, subject, a.get("category", "General"), user["full_name"], ts, ts))
+        conn.execute("INSERT INTO query_messages(query_id,sender,is_staff,body,created_at) VALUES(?,?,?,?,?)",
+                     (cur.lastrowid, user["full_name"], 0, a.get("message", ""), ts))
+        r = conn.execute("SELECT * FROM queries WHERE id=?", (cur.lastrowid,)).fetchone()
+        d = query_to_api(r)
+        d["message"] = a.get("message", "")
+        return {"status": "success", "data": d}
+
+    def api_queries_reply_query(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        r = conn.execute("SELECT * FROM queries WHERE company_id=? AND ref=?", (cid, a.get("id"))).fetchone()
+        if not r:
+            raise ApiError("Query not found.", 404)
+        ts = now()
+        conn.execute("INSERT INTO query_messages(query_id,sender,is_staff,body,created_at) VALUES(?,?,?,?,?)",
+                     (r["id"], user["full_name"], 0, a.get("message", ""), ts))
+        conn.execute("UPDATE queries SET status='Open', updated_at=? WHERE id=?", (ts, r["id"]))
+        return {"status": "success"}
+
+    # ─────────────── team ───────────────
+    def api_team_get_team_members(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        rows = conn.execute(
+            "SELECT m.*, u.full_name FROM company_members m LEFT JOIN users u ON u.email=m.user_email "
+            "WHERE m.company_id=?", (cid,)).fetchall()
+        return {"status": "success", "data": [
+            {"name": r["user_email"], "email": r["user_email"], "full_name": r["full_name"] or r["user_email"],
+             "role": r["role"], "status": r["status"], "initials": initials(r["full_name"] or r["user_email"])}
+            for r in rows]}
+
+    def api_team_invite_team_member(self, conn, a):
+        user = self._user(conn)
+        cid, role = self._company(conn, user)
+        if role not in ("Owner", "Admin"):
+            raise ApiError("Only owners can invite members.", 403)
+        email = (a.get("email") or "").strip().lower()
+        if not email:
+            raise ApiError("Email is required.")
+        target = conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone()
+        conn.execute("INSERT OR REPLACE INTO company_members VALUES(?,?,?,?)",
+                     (cid, email, a.get("role", "Bookkeeping"), "Active" if target else "Invited"))
+        return {"status": "success", "message": "Invitation recorded"}
+
+    # ─────────────── tasks / notifications ───────────────
+    def api_tasks_get_tasks(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        rows = conn.execute("SELECT * FROM tasks WHERE company_id=? ORDER BY due_date", (cid,)).fetchall()
+        return {"status": "success", "data": [
+            {"name": r["ref"], "title": r["title"], "due_date": r["due_date"], "priority": r["priority"],
+             "status": r["status"], "days_remaining": days_until(r["due_date"]) if r["due_date"] else None}
+            for r in rows]}
+
+    def api_notifications_get_notifications(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        rows = conn.execute("SELECT * FROM notifications WHERE company_id=? AND user_email=? ORDER BY id DESC",
+                            (cid, user["email"])).fetchall()
+        return {"status": "success", "data": [
+            {"id": r["id"], "title": r["title"], "body": r["body"], "is_read": bool(r["is_read"]),
+             "time": rel_time(r["created_at"])} for r in rows]}
+
+    def api_notifications_mark_all_read(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        conn.execute("UPDATE notifications SET is_read=1 WHERE company_id=? AND user_email=?",
+                     (cid, user["email"]))
+        return {"status": "success"}
+
+    # ─────────────── dev-only staff actions ───────────────
+    def _dev(self, conn):
+        if not ENABLE_DEV_STAFF:
+            raise ApiError("Dev staff actions are disabled.", 403)
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        return user, cid
+
+    def _notify(self, conn, cid, title, body):
+        for m in conn.execute("SELECT user_email FROM company_members WHERE company_id=?", (cid,)):
+            conn.execute("INSERT INTO notifications(company_id,user_email,title,body,created_at) VALUES(?,?,?,?,?)",
+                         (cid, m["user_email"], title, body, now()))
+
+    def api_dev_set_submission_status(self, conn, a):
+        user, cid = self._dev(conn)
+        status = a.get("status")
+        if status not in ("Submitted", "Received", "In Review", "Needs Info", "Processed", "Rejected"):
+            raise ApiError("Invalid status.")
+        conn.execute("UPDATE submissions SET status=?, updated_at=? WHERE company_id=? AND ref=?",
+                     (status, now(), cid, a.get("reference")))
+        self._notify(conn, cid, "Submission updated", f"{a.get('reference')} is now {status}")
+        return {"status": "success"}
+
+    def api_dev_create_request(self, conn, a):
+        user, cid = self._dev(conn)
+        ref = self._new_ref(conn, "requests", "RQ")
+        due = a.get("due_date") or (datetime.date.today() + datetime.timedelta(days=5)).isoformat()
+        conn.execute(
+            "INSERT INTO requests(ref,company_id,submission_ref,title,message,due_date,assigned_to,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (ref, cid, a.get("submission"), a.get("title", "Information needed"), a.get("message", ""),
+             due, "Accounting Team", now()))
+        if a.get("submission"):
+            conn.execute("UPDATE submissions SET status='Needs Info', updated_at=? WHERE company_id=? AND ref=?",
+                         (now(), cid, a["submission"]))
+        self._notify(conn, cid, "Information requested", a.get("title", "Information needed"))
+        return {"status": "success", "reference": ref}
+
+    def api_dev_create_task(self, conn, a):
+        user, cid = self._dev(conn)
+        ref = self._new_ref(conn, "tasks", "TSK")
+        conn.execute("INSERT INTO tasks(ref,company_id,title,due_date,priority,created_at) VALUES(?,?,?,?,?,?)",
+                     (ref, cid, a.get("title", "Task"), a.get("due_date", ""), a.get("priority", "Medium"), now()))
+        return {"status": "success", "reference": ref}
+
+    def api_dev_staff_reply_query(self, conn, a):
+        user, cid = self._dev(conn)
+        r = conn.execute("SELECT * FROM queries WHERE company_id=? AND ref=?", (cid, a.get("id"))).fetchone()
+        if not r:
+            raise ApiError("Query not found.", 404)
+        conn.execute("INSERT INTO query_messages(query_id,sender,is_staff,body,created_at) VALUES(?,?,?,?,?)",
+                     (r["id"], "Accounting Team", 1, a.get("message", ""), now()))
+        conn.execute("UPDATE queries SET status='Replied', assigned_to='Accounting Team', updated_at=? WHERE id=?",
+                     (now(), r["id"]))
+        self._notify(conn, cid, "New reply on your query", r["subject"])
+        return {"status": "success"}
+
 
 def run():
-    server_address = ("", PORT)
-    httpd = HTTPServer(server_address, FrappeApiHandler)
+    init_db()
+    httpd = ThreadingHTTPServer(("", PORT), Handler)
     print("=" * 60)
-    print("[SERVER] Frappe Client Portal Local Dev Server Running!")
+    print("[SERVER] Frappe Client Portal Local Dev Server (SQLite) running")
     print(f"[SERVER] Address: http://localhost:{PORT}")
-    print(f"[SERVER] Connected to React Frontend: http://localhost:5173")
-    print(f"[SERVER] Active Users: vikaspurohit105@gmail.com | owner@northstar.co.uk | bookkeeper@northstar.co.uk | payroll@northstar.co.uk")
-    print(f"[SERVER] 2FA OTP Service: Active on /send_otp and /verify_otp (Demo code 123456 supported)")
+    print(f"[SERVER] DB: {DB_PATH}")
+    print(f"[SERVER] 2FA enabled: {ENABLE_2FA}")
+    print("[SERVER] Test accounts (no data, no companies):")
+    for email, name, pwd in SEED_USERS:
+        print(f"         {email}  /  {pwd}")
     print("=" * 60)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[SERVER] Server stopped.")
+        print("\n[SERVER] Shutting down")
+
 
 if __name__ == "__main__":
     run()
