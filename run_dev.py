@@ -2,6 +2,7 @@
 Standalone Local Development Server for Frappe Client Portal Backend
 Runs directly on Windows without requiring WSL or Frappe Bench setup.
 Serves Frappe API endpoints on port 8000 with CORS enabled for Vite frontend (5173).
+Includes real 2FA OTP generation and verification, submissions engine, requests & helpdesk.
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -9,6 +10,7 @@ import json
 import urllib.parse
 import os
 import datetime
+import random
 import sys
 
 # Ensure UTF-8 output on Windows
@@ -20,33 +22,43 @@ except Exception:
 PORT = 8000
 
 DEMO_USERS = {
+    "vikaspurohit105@gmail.com": {
+        "name": "Vikas Purohit",
+        "role": "Owner",
+        "company": "Northstar Creative Ltd",
+        "password": "Password123!",
+        "phone": "+44 7700 900123"
+    },
     "owner@northstar.co.uk": {
         "name": "Sarah Mitchell",
         "role": "Owner",
         "company": "Northstar Creative Ltd",
-        "password": "Password123!"
+        "password": "Password123!",
+        "phone": "+44 7700 900456"
     },
     "bookkeeper@northstar.co.uk": {
         "name": "Priya Nair",
         "role": "Bookkeeping",
         "company": "Northstar Creative Ltd",
-        "password": "Password123!"
+        "password": "Password123!",
+        "phone": "+44 7700 900789"
     },
     "payroll@northstar.co.uk": {
         "name": "Mike Ross",
         "role": "Payroll",
         "company": "Northstar Creative Ltd",
-        "password": "Password123!"
+        "password": "Password123!",
+        "phone": "+44 7700 900321"
     }
 }
 
-# In-memory test state
+# In-memory dynamic test state
 STATE = {
     "user": {
-        "email": "owner@northstar.co.uk",
-        "first_name": "Sarah",
-        "last_name": "Mitchell",
-        "full_name": "Sarah Mitchell"
+        "email": "vikaspurohit105@gmail.com",
+        "first_name": "Vikas",
+        "last_name": "Purohit",
+        "full_name": "Vikas Purohit"
     },
     "company": {
         "name": "Northstar Creative Ltd",
@@ -64,13 +76,14 @@ STATE = {
         "status": "Active"
     },
     "role": "Owner",
+    "active_otps": {},
     "submissions": [
         {
             "name": "REF-1042",
             "submission_type": "Sales Invoice",
             "status": "Submitted",
             "period": "Oct 2026",
-            "submitted_by": "Sarah Mitchell",
+            "submitted_by": "Vikas Purohit",
             "total_gross": 2400.0,
             "creation": "2026-10-08 14:30:00",
             "modified": "2026-10-08 14:30:00",
@@ -129,11 +142,33 @@ STATE = {
             "name": "RQ-001",
             "submission": "REF-1041",
             "title": "Missing VAT Receipt for Trainline",
-            "message": "Hi Sarah, the attachment for REF-1041 is just a booking confirmation. Please attach the tax receipt showing the VAT breakdown.",
+            "message": "Hi Vikas, the attachment for REF-1041 is just a booking confirmation. Please attach the tax receipt showing the VAT breakdown.",
             "due_date": "2026-10-15",
+            "days_left": 2,
             "is_urgent": 1,
             "status": "Pending",
+            "assigned_to": "Alex Morgan",
             "client_reply": None
+        }
+    ],
+    "queries": [
+        {
+            "id": "HD-2045",
+            "subject": "Tax code discrepancy on September invoice",
+            "category": "Tax",
+            "status": "Replied",
+            "updated": "Today, 10:45 AM",
+            "assigned": "Sarah Jenkins",
+            "message": "We noticed a discrepancy in the tax code applied on the INV-0042 draft."
+        },
+        {
+            "id": "HD-2044",
+            "subject": "Question regarding travel expense VAT",
+            "category": "Expenses",
+            "status": "Open",
+            "updated": "Yesterday, 3:20 PM",
+            "assigned": "Unassigned",
+            "message": "Can we reclaim VAT on international train bookings?"
         }
     ]
 }
@@ -187,25 +222,27 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
                 }
             })
 
-        # 2. get_dashboard_summary
+        # 2. get_dashboard_summary (Dynamic real counts & tasks)
         if path.endswith("/frappe_client_portal.api.dashboard.get_dashboard_summary"):
             counts = {
                 "submitted": sum(1 for s in STATE["submissions"] if s["status"] == "Submitted"),
-                "received": 0,
+                "received": sum(1 for s in STATE["submissions"] if s["status"] == "Received"),
                 "in_review": sum(1 for s in STATE["submissions"] if s["status"] == "In Review"),
                 "needs_info": sum(1 for s in STATE["submissions"] if s["status"] == "Needs Info"),
                 "processed": sum(1 for s in STATE["submissions"] if s["status"] == "Processed"),
                 "rejected": sum(1 for s in STATE["submissions"] if s["status"] == "Rejected")
             }
+            pending_requests = [r for r in STATE["requests"] if r["status"] == "Pending"]
             return self._send_json({
                 "status": "success",
                 "data": {
                     "counts": counts,
-                    "urgent_requests": [r for r in STATE["requests"] if r["status"] == "Pending"],
+                    "urgent_requests": pending_requests,
                     "upcoming_tasks": [
-                        {"name": "TSK-01", "title": "Upload October bank statements", "due_date": "2026-10-25", "priority": "High", "status": "Open"},
-                        {"name": "TSK-02", "title": "Review Q3 VAT Return draft", "due_date": "2026-10-31", "priority": "Urgent", "status": "In Progress"}
-                    ]
+                        {"name": "TSK-01", "title": "VAT Return Q3 Review", "due_date": "2026-11-07", "days_remaining": 25, "priority": "Urgent", "status": "In Progress"},
+                        {"name": "TSK-02", "title": "Annual Accounts Preparation", "due_date": "2026-12-31", "days_remaining": 79, "priority": "High", "status": "Open"}
+                    ],
+                    "open_queries_count": len([q for q in STATE["queries"] if q["status"] != "Closed"])
                 }
             })
 
@@ -244,26 +281,38 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
 
         # 5. get_requests
         if path.endswith("/frappe_client_portal.api.requests.get_requests"):
+            req_status = query.get("status", [""])[0]
+            reqs = STATE["requests"]
+            if req_status:
+                reqs = [r for r in reqs if r["status"] == req_status]
             return self._send_json({
                 "status": "success",
-                "data": STATE["requests"]
+                "data": reqs
             })
 
-        # 6. get_company_profile
+        # 6. get_queries
+        if path.endswith("/frappe_client_portal.api.queries.get_queries"):
+            return self._send_json({
+                "status": "success",
+                "data": STATE["queries"]
+            })
+
+        # 7. get_company_profile
         if path.endswith("/frappe_client_portal.api.company.get_company_profile"):
             return self._send_json({
                 "status": "success",
                 "data": STATE["company"]
             })
 
-        # 7. get_team_members
+        # 8. get_team_members
         if path.endswith("/frappe_client_portal.api.team.get_team_members"):
             return self._send_json({
                 "status": "success",
                 "data": [
-                    {"name": "LINK-01", "user": "owner@northstar.co.uk", "name_display": "Sarah Mitchell", "portal_role": "Owner", "status": "Active", "last_login": "Today, 14:00"},
-                    {"name": "LINK-02", "user": "bookkeeper@northstar.co.uk", "name_display": "Priya Nair", "portal_role": "Bookkeeping", "status": "Active", "last_login": "Yesterday, 09:15"},
-                    {"name": "LINK-03", "user": "payroll@northstar.co.uk", "name_display": "Mike Ross", "portal_role": "Payroll", "status": "Active", "last_login": "05 Oct 2026"}
+                    {"name": "LINK-01", "user": "vikaspurohit105@gmail.com", "name_display": "Vikas Purohit", "portal_role": "Owner", "status": "Active", "last_login": "Today, 17:30"},
+                    {"name": "LINK-02", "user": "owner@northstar.co.uk", "name_display": "Sarah Mitchell", "portal_role": "Owner", "status": "Active", "last_login": "Today, 14:00"},
+                    {"name": "LINK-03", "user": "bookkeeper@northstar.co.uk", "name_display": "Priya Nair", "portal_role": "Bookkeeping", "status": "Active", "last_login": "Yesterday, 09:15"},
+                    {"name": "LINK-04", "user": "payroll@northstar.co.uk", "name_display": "Mike Ross", "portal_role": "Payroll", "status": "Active", "last_login": "05 Oct 2026"}
                 ]
             })
 
@@ -283,19 +332,24 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
             if not matched:
                 return self._send_json({
                     "status": "error",
-                    "message": "Invalid email address. Please use one of the demo accounts (owner@northstar.co.uk, bookkeeper@northstar.co.uk, payroll@northstar.co.uk)."
+                    "message": "Invalid email address. Please use vikaspurohit105@gmail.com or one of the demo accounts."
                 }, 401)
             
             if pwd != matched["password"]:
                 return self._send_json({
                     "status": "error",
-                    "message": "Invalid password. The demo account password is Password123!"
+                    "message": "Invalid password. The account password is Password123!"
                 }, 401)
             
             STATE["user"]["email"] = usr
             STATE["user"]["full_name"] = matched["name"]
             STATE["role"] = matched["role"]
             STATE["company"]["name"] = matched["company"]
+
+            # Generate 2FA code
+            otp_code = str(random.randint(100000, 999999))
+            STATE["active_otps"][usr] = otp_code
+            print(f"[2FA AUTH] >>> Sent 6-digit verification code: {otp_code} to {usr} <<<")
             
             return self._send_json({
                 "status": "success",
@@ -305,8 +359,39 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
                 "company": matched["company"],
                 "role": matched["role"],
                 "portal_role": matched["role"],
-                "two_factor_required": True
+                "two_factor_required": True,
+                "otp": otp_code
             })
+
+        # Send 2FA OTP Code
+        if path.endswith("/frappe_client_portal.api.auth.send_otp"):
+            usr = body.get("usr", "").strip().lower() or STATE["user"]["email"]
+            otp_code = str(random.randint(100000, 999999))
+            STATE["active_otps"][usr] = otp_code
+            print(f"[2FA AUTH] >>> Dispatched 6-digit verification code: {otp_code} to {usr} <<<")
+            return self._send_json({
+                "status": "success",
+                "message": f"Verification code sent to {usr}",
+                "otp": otp_code,
+                "email": usr
+            })
+
+        # Verify 2FA OTP Code
+        if path.endswith("/frappe_client_portal.api.auth.verify_otp"):
+            usr = body.get("usr", "").strip().lower() or STATE["user"]["email"]
+            code = str(body.get("code", "")).strip()
+            valid_code = STATE.get("active_otps", {}).get(usr)
+            if code == valid_code or code == "123456":
+                return self._send_json({
+                    "status": "success",
+                    "message": "2FA verification successful",
+                    "verified": True,
+                    "user": usr
+                })
+            return self._send_json({
+                "status": "error",
+                "message": "Invalid 2FA code. Please enter the code sent to your email or use 123456."
+            }, 400)
 
         # Logout
         if path.endswith("/frappe_client_portal.api.auth.logout"):
@@ -353,11 +438,7 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             for item in file_urls:
-                if isinstance(item, dict):
-                    doc_name = item.get("name", "Document.pdf")
-                else:
-                    doc_name = str(item)
-                
+                doc_name = item.get("name", "Document.pdf") if isinstance(item, dict) else str(item)
                 new_sub = {
                     "name": ref,
                     "submission_type": category,
@@ -382,12 +463,28 @@ class FrappeApiHandler(BaseHTTPRequestHandler):
 
         # Reply to Staff Request
         if path.endswith("/frappe_client_portal.api.requests.reply_request"):
-            req_id = body.get("request_id")
+            req_id = body.get("request_id") or body.get("requestId")
+            reply_text = body.get("reply_text") or body.get("replyText")
             for r in STATE["requests"]:
                 if r["name"] == req_id:
-                    r["status"] = "Resolved"
-                    r["client_reply"] = body.get("reply_text")
+                    r["status"] = "Completed"
+                    r["client_reply"] = reply_text
             return self._send_json({"status": "success", "message": "Reply sent successfully"})
+
+        # Create New Query (Helpdesk)
+        if path.endswith("/frappe_client_portal.api.queries.create_query"):
+            new_id = f"HD-{2046 + len(STATE['queries'])}"
+            new_q = {
+                "id": new_id,
+                "subject": body.get("subject", "General Inquiry"),
+                "category": body.get("category", "General"),
+                "status": "Open",
+                "updated": "Just now",
+                "assigned": "Accounting Team",
+                "message": body.get("message", "")
+            }
+            STATE["queries"].insert(0, new_q)
+            return self._send_json({"status": "success", "data": new_q})
 
         # Update company profile
         if path.endswith("/frappe_client_portal.api.company.update_company_profile"):
@@ -404,7 +501,8 @@ def run():
     print("[SERVER] Frappe Client Portal Local Dev Server Running!")
     print(f"[SERVER] Address: http://localhost:{PORT}")
     print(f"[SERVER] Connected to React Frontend: http://localhost:5173")
-    print(f"[SERVER] Demo Accounts Ready: owner@northstar.co.uk | bookkeeper@northstar.co.uk | payroll@northstar.co.uk")
+    print(f"[SERVER] Active Users: vikaspurohit105@gmail.com | owner@northstar.co.uk | bookkeeper@northstar.co.uk | payroll@northstar.co.uk")
+    print(f"[SERVER] 2FA OTP Service: Active on /send_otp and /verify_otp (Demo code 123456 supported)")
     print("=" * 60)
     try:
         httpd.serve_forever()
