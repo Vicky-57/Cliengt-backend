@@ -154,6 +154,10 @@ def rel_time(ts):
 
 def sub_to_api(r):
     d = dict(r)
+    items = json.loads(d["items"] or "[]")
+    doc_date = None
+    if items and isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict):
+        doc_date = items[0].get("date")
     return {
         "name": d["ref"],
         "submission_type": d["submission_type"],
@@ -161,10 +165,11 @@ def sub_to_api(r):
         "period": d["period"],
         "submitted_by": d["submitted_by"],
         "total_gross": d["total_gross"],
+        "date": doc_date or (d["created_at"].split(" ")[0] if d.get("created_at") else ""),
         "creation": d["created_at"],
         "modified": d["updated_at"],
         "notes": d["notes"],
-        "items": json.loads(d["items"] or "[]"),
+        "items": items,
         "files": json.loads(d["files"] or "[]"),
     }
 
@@ -451,11 +456,18 @@ class Handler(BaseHTTPRequestHandler):
     def _create_submission(self, conn, user, cid, stype, prefix, a, items=None, total=0, files=None):
         ref = self._new_ref(conn, "submissions", prefix)
         ts = now()
+        date_val = a.get("date")
+        if date_val:
+            if not items:
+                items = [{"date": date_val}]
+            elif isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict) and not items[0].get("date"):
+                items[0]["date"] = date_val
         conn.execute(
             "INSERT INTO submissions(ref,company_id,submission_type,status,period,submitted_by,notes,"
             "total_gross,items,files,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (ref, cid, stype, "Submitted", a.get("period", ""), user["full_name"], a.get("notes", ""),
              total, json.dumps(items or []), json.dumps(files or []), ts, ts))
+        self._notify(conn, cid, f"{stype} submitted", f"{ref} has been received for processing.")
         return ref
 
     def _as_list(self, v):
@@ -471,8 +483,16 @@ class Handler(BaseHTTPRequestHandler):
         cid, _ = self._company(conn, user)
         sql, p = "SELECT * FROM submissions WHERE company_id=?", [cid]
         if a.get("submission_type"):
-            sql += " AND submission_type=?"
-            p.append(a["submission_type"])
+            stype = a["submission_type"]
+            if stype in ("Sales Invoice", "Purchase Invoice"):
+                sql += " AND (submission_type='Purchase Invoice' OR submission_type='Sales Invoice')"
+            elif stype in ("Expense", "Expense Claim"):
+                sql += " AND (submission_type='Expense Claim' OR submission_type='Expense')"
+            elif stype in ("Bank Statement", "Document"):
+                sql += " AND (submission_type='Bank Statement' OR submission_type='Document')"
+            else:
+                sql += " AND submission_type=?"
+                p.append(stype)
         if a.get("status"):
             sql += " AND status=?"
             p.append(a["status"])
@@ -509,8 +529,8 @@ class Handler(BaseHTTPRequestHandler):
         user = self._user(conn)
         cid, _ = self._company(conn, user)
         items = self._as_list(a.get("items"))
-        total = float(a.get("total_amount") or a.get("total") or 0)
-        ref = self._create_submission(conn, user, cid, "Sales Invoice", "INV", a, items, total)
+        total = float(a.get("total_amount") or a.get("total") or a.get("amount") or 0)
+        ref = self._create_submission(conn, user, cid, "Purchase Invoice", "INV", a, items, total)
         return {"status": "success", "reference": ref}
 
     def api_submissions_submit_payroll(self, conn, a):
@@ -607,6 +627,7 @@ class Handler(BaseHTTPRequestHandler):
             "VALUES(?,?,?,?,?,?,?)", (ref, cid, subject, a.get("category", "General"), user["full_name"], ts, ts))
         conn.execute("INSERT INTO query_messages(query_id,sender,is_staff,body,created_at) VALUES(?,?,?,?,?)",
                      (cur.lastrowid, user["full_name"], 0, a.get("message", ""), ts))
+        self._notify(conn, cid, "Query submitted", f"Ticket {ref}: {subject} is now open with accounting.")
         r = conn.execute("SELECT * FROM queries WHERE id=?", (cur.lastrowid,)).fetchone()
         d = query_to_api(r)
         d["message"] = a.get("message", "")
@@ -650,6 +671,28 @@ class Handler(BaseHTTPRequestHandler):
         return {"status": "success", "message": "Invitation recorded"}
 
     # ─────────────── tasks / notifications ───────────────
+    def api_tasks_create_task(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        ref = self._new_ref(conn, "tasks", "TSK")
+        due = a.get("due_date") or ""
+        title = (a.get("title") or "Task").strip()
+        conn.execute(
+            "INSERT INTO tasks(ref,company_id,title,due_date,priority,created_at) VALUES(?,?,?,?,?,?)",
+            (ref, cid, title, due, a.get("priority", "Medium"), now()),
+        )
+        self._notify(conn, cid, "New task scheduled", title)
+        return {"status": "success", "reference": ref}
+
+    def api_tasks_update_task_status(self, conn, a):
+        user = self._user(conn)
+        cid, _ = self._company(conn, user)
+        status = a.get("status", "Done")
+        ref = a.get("id") or a.get("reference")
+        conn.execute("UPDATE tasks SET status=? WHERE company_id=? AND (ref=? OR id=?)",
+                     (status, cid, ref, ref))
+        return {"status": "success"}
+
     def api_tasks_get_tasks(self, conn, a):
         user = self._user(conn)
         cid, _ = self._company(conn, user)
