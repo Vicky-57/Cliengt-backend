@@ -19,10 +19,10 @@ import sqlite3
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 8000
+PORT = int(os.environ.get("PORT", 8000))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "dev.db")
-FRONTEND_ORIGIN = "http://localhost:5173"
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
 
 ENABLE_2FA = os.environ.get("ENABLE_2FA", "false").lower() == "true"
 ENABLE_DEV_STAFF = os.environ.get("ENABLE_DEV_STAFF", "true").lower() == "true"
@@ -278,6 +278,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.rstrip("/") in ("", "/health", "/healthz"):
+            return self._send({"status": "healthy", "service": "Frappe Client Portal Backend", "time": now()})
         method = parsed.path.rsplit("/", 1)[-1]
         try:
             args = self._args(parsed)
