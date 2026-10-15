@@ -217,11 +217,22 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _cors(self):
-        origin = self.headers.get("Origin") or FRONTEND_ORIGIN
+        origin = self.headers.get("Origin")
+        if not origin:
+            origin = "*"
         self.send_header("Access-Control-Allow-Origin", origin)
-        self.send_header("Access-Control-Allow-Credentials", "true")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Company, Accept")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        if origin != "*":
+            self.send_header("Access-Control-Allow-Credentials", "true")
+
+        req_headers = self.headers.get("Access-Control-Request-Headers")
+        if req_headers:
+            self.send_header("Access-Control-Allow-Headers", req_headers)
+        else:
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, Authorization, X-Company, Accept, Origin, X-Requested-With, Cache-Control, Pragma")
+
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Max-Age", "86400")
         self.send_header("Vary", "Origin")
 
     def do_OPTIONS(self):
@@ -242,12 +253,18 @@ class Handler(BaseHTTPRequestHandler):
         args = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         length = int(self.headers.get("Content-Length") or 0)
         if length:
-            try:
-                body = json.loads(self.rfile.read(length).decode() or "{}")
-                if isinstance(body, dict):
-                    args.update(body)
-            except Exception:
-                raise ApiError("Invalid JSON body")
+            raw_body = self.rfile.read(length).decode("utf-8", errors="replace")
+            content_type = self.headers.get("Content-Type", "")
+            if "application/json" in content_type or raw_body.strip().startswith(("{", "[")):
+                try:
+                    body = json.loads(raw_body or "{}")
+                    if isinstance(body, dict):
+                        args.update(body)
+                except Exception:
+                    raise ApiError("Invalid JSON body")
+            elif "application/x-www-form-urlencoded" in content_type:
+                form_args = {k: v[0] for k, v in urllib.parse.parse_qs(raw_body).items()}
+                args.update(form_args)
         return args
 
     def _user(self, conn, required=True):
@@ -307,6 +324,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch()
 
+    def do_PUT(self):
+        self._dispatch()
+
+    def do_PATCH(self):
+        self._dispatch()
+
+    def do_DELETE(self):
+        self._dispatch()
+
     # ─────────────── auth ───────────────
     def _user_payload(self, conn, user):
         comps = conn.execute(
@@ -323,8 +349,8 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def api_auth_login(self, conn, a):
-        usr = (a.get("usr") or "").strip().lower()
-        pwd = a.get("pwd") or ""
+        usr = (a.get("usr") or a.get("email") or a.get("username") or "").strip().lower()
+        pwd = a.get("pwd") or a.get("password") or ""
         user = conn.execute("SELECT * FROM users WHERE email=?", (usr,)).fetchone()
         if not user or not check_pw(pwd, user["password_hash"]):
             raise ApiError("Incorrect email or password.", 401)
@@ -374,7 +400,7 @@ class Handler(BaseHTTPRequestHandler):
     def api_company_create_company(self, conn, a):
         user = self._user(conn)
         data = a.get("data") if isinstance(a.get("data"), dict) else a
-        name = (data.get("name") or "").strip()
+        name = (data.get("name") or data.get("company_name") or "").strip()
         if not name:
             raise ApiError("Company name is required.")
         cur = conn.execute(
@@ -401,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
         cid, role = self._company(conn, user)
         if role not in ("Owner", "Admin"):
             raise ApiError("Only owners can edit the company profile.", 403)
-        data = a.get("data") if isinstance(a.get("data"), dict) else {}
+        data = a.get("data") if isinstance(a.get("data"), dict) else a
         allowed = {"name", "company_number", "type", "address", "vat_number", "year_end", "phone", "email"}
         for k, v in data.items():
             if k in allowed:
